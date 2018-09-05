@@ -1,0 +1,208 @@
+from datetime import datetime
+from sklearn import preprocessing, svm
+import numpy as np
+import pandas as pd
+
+
+# Inputs
+inputs = {
+    'test_start_date': datetime.strptime('2006-03-31', '%Y-%m-%d'),  # start date for testing weights in dd/mm/yyyy format '31/03/2006'
+    'test_end_date': datetime.strptime('2018-03-31', '%Y-%m-%d'),  # end date for testing weights in dd/mm/yyyy format
+    'portfolio_date': datetime.strptime('2018-03-31', '%Y-%m-%d'),  # as at date for portfolio creation in dd/mm/yyyy format
+    'portfolio_type': 'endurance',  # [Endurance, Classic, Bull]
+    'shares_in_portfolios': 10,  # change 'bnds' manually when changing this
+    'stoploss': 0.15,
+    'leverage': 1,
+}
+
+def to_datetime(d):
+    return datetime.strptime(d, '%d/%m/%Y')
+
+def to_datetime2(d):
+    return datetime.strptime(d, '%Y-%m-%d')
+
+def dates():
+    start_date = pd.to_datetime(inputs['test_start_date'])
+    end_date = pd.to_datetime(inputs['test_end_date'])
+
+    all_dates = []
+    while start_date <= end_date:
+        all_dates.append(start_date)
+        start_date = all_dates[-1] + pd.DateOffset(days=1)
+    all_dates = pd.DataFrame(all_dates)
+    all_dates.rename(columns={list(all_dates)[0]: 'date'}, inplace=True)
+    all_dates.set_index('date', inplace=True)
+
+    return all_dates
+
+def read_data_file(filename, fundamental, dates_population, date_func, **keyword_parameters):
+    data_file = 'data_files/' + filename
+    df =  pd.read_csv(data_file, converters={'date': date_func}, low_memory=False, index_col='date')
+
+    all_dates = dates()
+
+    df = all_dates.join(df)
+    df.fillna(method='ffill', inplace=True)
+    df = df[df.index.isin(dates_population)]
+
+    if ('pct_chg' in keyword_parameters):
+        if keyword_parameters['pct_chg']:
+            # df = df[df.index.isin(dates_population)]
+            df = df.pct_change()
+
+    if ('pct_rank' in keyword_parameters):
+        if keyword_parameters['pct_rank']:
+            df = df.rank(1, ascending=True, pct=True, method='first')
+
+    if ('offset' in keyword_parameters):
+        df = df.shift(int(keyword_parameters['offset']))
+
+    if ('stacked' in keyword_parameters):
+        if keyword_parameters['stacked']:
+            df = pd.DataFrame(df.stack())
+            df.columns=[fundamental]
+
+    return df
+
+
+def Build_DataFrame(dates):
+
+    # load all data into tables
+    dfPE = read_data_file('sharadar_pe.csv', 'PE', dates, to_datetime, pct_rank=False, stacked=True)
+    dfMC = read_data_file('sharadar_marketcap.csv', 'MC', dates, to_datetime, pct_rank=False, stacked=True)
+    dfDY = read_data_file('sharadar_divyield.csv', 'DY', dates, to_datetime, pct_rank=False, stacked=True)
+    dfCR = read_data_file('sharadar_currentratio.csv', 'CR', dates, to_datetime, pct_rank=False, stacked=True)
+    dfROE = read_data_file('sharadar_roe.csv', 'ROE', dates, to_datetime, pct_rank=False, stacked=True)
+    dfROIC = read_data_file('sharadar_roic.csv', 'ROIC', dates, to_datetime, pct_rank=False, stacked=True)
+    dfPrices = read_data_file('tiingo_prices.csv', 'Price', dates, to_datetime2, stacked=True)
+
+    dfPCTBack = read_data_file('tiingo_prices.csv', 'Stock_p_chg_back', dates, to_datetime2, stacked=True, pct_chg=True)
+    dfIndexBack = read_data_file('spy.csv', 'Index_p_chg_back', dates, to_datetime2, stacked=True, pct_chg=True)
+    dfIndexBack.reset_index(level=1, inplace=True)
+    dfIndexBack = dfIndexBack[['Index_p_chg_back']]
+
+    df = dfPrices.join(dfPE).join(dfMC).join(dfDY).join(dfCR).join(dfROE).join(dfROIC).join(dfPCTBack).join(dfIndexBack)
+
+    return df
+
+
+def BackTestDF():
+    start_date = pd.to_datetime(inputs['test_start_date'])
+    end_date = pd.to_datetime(inputs['test_end_date'])
+
+    dates_population = []
+    while start_date <= end_date:
+        dates_population.append(start_date)
+        start_date = dates_population[-1] + pd.DateOffset(months=2) + pd.tseries.offsets.QuarterEnd()
+
+    df = Build_DataFrame(dates_population)
+
+    dfPCTFwd = read_data_file('tiingo_prices.csv', 'Stock_p_chg_fwd', dates_population, to_datetime2, stacked=True, pct_chg=True, offset=-1)
+    dfIndexFwd = read_data_file('spy.csv', 'Index_p_chg_fwd', dates_population, to_datetime2, stacked=True, pct_chg=True, offset=-1)
+    dfIndexFwd.reset_index(level=1, inplace=True)
+    dfIndexFwd = dfIndexFwd[['Index_p_chg_fwd']]
+
+    df = df.join(dfPCTFwd).join(dfIndexFwd)
+    df.reset_index(level=1, inplace=True)
+    df.rename(columns={list(df)[0]: 'Ticker'}, inplace=True)
+    # df.dropna(inplace=True)
+
+    df["Beat_market_last3M"] = df.apply(lambda row: [row['Stock_p_chg_back'] > row['Index_p_chg_back']][0], axis=1)
+    df["Beat_market_Next3M"] = df.apply(lambda row: [row['Stock_p_chg_fwd'] > row['Index_p_chg_fwd']][0], axis=1)
+
+    df.to_csv("MLdataframe.csv")
+
+
+def Analysis_Data_Set():
+
+    features = [
+        "MC",
+        "PE",
+        "DY",
+        "CR",
+        "ROE",
+        "ROIC",
+        "Stock_p_chg_back",
+    ]
+
+    df = pd.read_csv("MLdataframe.csv", converters={'date': to_datetime2}, low_memory=False)#, index_col='date')
+    df.dropna(inplace=True)
+    # df.fillna(-99999, inplace=True)
+    df = df.reindex(np.random.permutation(df.index))
+    df.set_index('date',inplace=True)
+    X = np.array(df[features].values)
+    y = df["Stock_p_chg_fwd"].values.tolist()
+
+    return X, y, df
+
+def Analysis():
+    X, y, df = Analysis_Data_Set()
+
+    train_size = 2000
+    clf = svm.SVR(kernel="rbf", C=1.0)
+    clf.fit(X[:-train_size],y[:-train_size])
+    # clf.fit(X, y)
+
+    predict_list = []
+    for i in range(df.shape[0]):
+        predict_list.append(clf.predict(X[[i]])[0])
+
+    df["Predict"] = predict_list
+
+    return df, clf
+
+def BackTest():
+    df, clf = Analysis()
+    count = 0
+    long = 0
+    short = 0
+    portfolio = 0
+    low = 999999999
+    negatives = 0
+    long_returns = []
+    short_returns = []
+    portfolio_returns = []
+    index = []
+    dates_population = df.index.unique()
+    for date in dates_population:
+        try:
+            count += 1
+            sorted_df = df[df.index == date].sort_values(by=['Predict'])
+            sorted_df = sorted_df[['Ticker','Price','Predict','Stock_p_chg_fwd']]
+            long_portfolio = sorted_df.tail(inputs['shares_in_portfolios'])
+            short_portfolio = sorted_df.head(inputs['shares_in_portfolios'])
+            # print(long_portfolio)
+            # print(short_portfolio)
+            avg_long = (long_portfolio['Stock_p_chg_fwd'].mean()*inputs['leverage']).round(4)
+            avg_short = -(short_portfolio['Stock_p_chg_fwd'].mean()*inputs['leverage']).round(4)
+            avg_portfolio = (avg_long/2+avg_short/2)
+            # avg_index = df['Index_p_chg_fwd'].iloc[0]
+            # print(avg_index)
+            long += avg_long
+            short += avg_short
+            portfolio += avg_portfolio
+            # index += avg_index
+            long_returns.append("%.2f" % round(avg_long*100,2))
+            short_returns.append("%.2f" % round(avg_short * 100,2))
+            portfolio_returns.append("%.2f" % round(avg_portfolio * 100,2))
+            if avg_portfolio < low:
+                low = avg_portfolio
+            if avg_portfolio < 0:
+                negatives += 1
+        except Exception as e:
+            print("Error:",str(e),date)
+    print("Total avg long per quarter:", round(long/count*100,2))
+    print("Total avg short per quarter:", round(short/count*100,2))
+    print("Total avg portfolio per quarter:", round(portfolio/count*100,2))
+    # print("Total index per quarter:", round(index / count * 100, 2))
+    print("Lowest portfolio return:","%.2f" % round(low*100,2))
+    print("Negative quarters:",negatives)
+
+
+    print("Long returns:",long_returns)
+    print("Short returns:", short_returns)
+    print("Portfolio returns:", portfolio_returns)
+
+
+# BackTestDF() #create DF for backtesting
+BackTest() # backtest with all dates in BackTestDF
